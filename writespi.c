@@ -1,7 +1,7 @@
 /*
  * writespi.c
  *
- * Copyright (C) 2014 Dream Property GmbH, Germany
+ * Copyright (C) 2016 Dream Property GmbH, Germany
  *                    http://www.dream-multimedia-tv.de/
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -36,13 +36,28 @@
 #include <time.h>
 #include <unistd.h>
 
+#define ARRAY_SIZE(x)		(sizeof((x)) / sizeof(*(x)))
+
+#if defined(__arm__)
+#define BCM_PHYSICAL_OFFSET	0xf0000000
+#else
 #define BCM_PHYSICAL_OFFSET	0x10000000
+#endif
+
 #define BCM_CHIP_FAMILY_ID	0x00404000
 
+#define HIF_MSPI_BCM73625	0x00413200
 #define HIF_MSPI_BCM7435	0x0041d400
+#define HIF_MSPI_BCM7439	0x003e3400
 #define HIF_MSPI_SIZE		0x188
+#define HIF_SPI_INTR2_BCM73625	0x00411d00
 #define HIF_SPI_INTR2_BCM7435	0x0041bd00
+#define HIF_SPI_INTR2_BCM7439	0x003e1a00
 #define HIF_SPI_INTR2_SIZE	0x30
+#define HIF_SPI_INTR2_CPU_SET_MSPI_DONE_MASK 0x20
+
+#define GIO_BCM73625		0x00406500
+#define GIO_SIZE		0xa0
 
 #define SPI_SECTOR_SIZE	4096
 #define SPI_PAGE_SIZE	256
@@ -65,6 +80,12 @@ enum spi_cmd {
 	SPI_CMD_BE		= 0xd8,
 };
 
+enum manuf_id {
+	MANUF_ID_EON = 0x1c,
+	MANUF_ID_MACRONIX = 0xc2,
+	MANUF_ID_WINBOND = 0xef,
+};
+
 #define SPI_RDSR_WIP		(1 << 0)
 #define SPI_RDSR_WEL		(1 << 1)
 #define SPI_RDSR_BP0		(1 << 2)
@@ -73,9 +94,47 @@ enum spi_cmd {
 #define SPI_RDSR_BP3		(1 << 5)
 #define SPI_RDSR_SRWD		(1 << 7)
 
+#define KiB(x)	((x) * 1024)
+#define MiB(x)	((x) * 1024 * 1024)
+
+struct flash_part {
+	char *name;
+	bool rdonly;
+	unsigned int size;
+};
+
+static const struct flash_part flash_map_73625[] = {
+	{ "fsbl", true, MiB(1) },
+	{ "ssbl", false, MiB(1) },
+	{ "nvram", true, KiB(256) },
+	{ "ssblconf", true, KiB(256) },
+	{ "reserved", true, KiB(512) },
+	{ "kernel", false, MiB(13) },
+};
+
+static const struct flash_part flash_map_7435[] = {
+	{ "fsbl", true, MiB(1) },
+	{ "kernel", false, MiB(15) },
+};
+
+static const struct flash_part flash_map_7439[] = {
+	{ "fsbl", true, MiB(2) },
+	{ "nvram", true, KiB(128) },
+	{ "devtree", true, KiB(128) },
+	{ "kernel", false, KiB(14080) },
+};
+
 static inline void cpu_relax(void)
 {
-#if defined(__mips__)
+#if defined(__aarch64__)
+	__asm__ volatile("yield" ::: "memory");
+#elif defined(__i386__) || defined(__x86_64__)
+	__asm__ volatile("rep; nop" ::: "memory");
+#elif defined(__ia64__)
+	__asm__ volatile("hint @pause" ::: "memory");
+#elif defined(__tile__)
+	__asm__ volatile("mfspr zero, PASS" ::: "memory");
+#else
 	__asm__ volatile("" ::: "memory");
 #endif
 }
@@ -140,38 +199,93 @@ static void spi_write_bytes(const unsigned char *out, unsigned char *in, size_t 
 	}
 }
 
-static bool spi_init(void)
+static bool dm520_setup_gpio(void)
+{
+	volatile unsigned long *mmio_gpio;
+
+	mmio_gpio = ioremap(BCM_PHYSICAL_OFFSET + GIO_BCM73625, GIO_SIZE);
+	if (mmio_gpio == NULL)
+		return false;
+
+	/* set SPI_SELECT output */
+	mmio_gpio[0x48/4] &= ~(1<<21);  //IO_DIR set output
+	/* select onboard spirom (in any case) */
+	mmio_gpio[0x44/4] |= (1<<21);   //IO_DATA
+
+	iounmap(mmio_gpio, GIO_SIZE);
+	return true;
+}
+
+static bool detect_soc(unsigned int *pchip_id)
 {
 	volatile unsigned long *family_id;
-	unsigned long chip_id;
+	unsigned int chip_id;
 
 	family_id = ioremap(BCM_PHYSICAL_OFFSET + BCM_CHIP_FAMILY_ID, 4);
-	if (family_id == NULL)
+	if (family_id == NULL) {
+		fprintf(stderr, "Failed to map chip family register!\n");
 		return false;
+	}
 
 	chip_id = *family_id;
 	chip_id = (chip_id >> 28 ? chip_id >> 16 : chip_id >> 8);
 	iounmap(family_id, 4);
 
-	if (chip_id != 0x7435)
-		return false;
+	if (chip_id == 0x73625 ||
+	    chip_id == 0x7435 ||
+	    chip_id == 0x7439) {
+		*pchip_id = chip_id;
+		return true;
+	}
 
-	mmio_spi = ioremap(BCM_PHYSICAL_OFFSET + HIF_MSPI_BCM7435, HIF_MSPI_SIZE);
+	fprintf(stderr, "Unsupported SoC: %#x\n", chip_id);
+	return false;
+}
+
+static bool spi_init(unsigned int chip_id)
+{
+	unsigned long hif_mspi;
+	unsigned long hif_spi_intr2;
+	unsigned char spcr;
+
+	switch (chip_id) {
+	case 0x73625:
+		hif_mspi = HIF_MSPI_BCM73625;
+		hif_spi_intr2 = HIF_SPI_INTR2_BCM73625;
+		spcr = 5;
+		if (!dm520_setup_gpio())
+			return false;
+		break;
+	case 0x7435:
+		hif_mspi = HIF_MSPI_BCM7435;
+		hif_spi_intr2 = HIF_SPI_INTR2_BCM7435;
+		spcr = 6;
+		break;
+	case 0x7439:
+		hif_mspi = HIF_MSPI_BCM7439;
+		hif_spi_intr2 = HIF_SPI_INTR2_BCM7439;
+		spcr = 8;
+		break;
+	default:
+		return false;
+	}
+
+	mmio_spi = ioremap(BCM_PHYSICAL_OFFSET + hif_mspi, HIF_MSPI_SIZE);
 	if (mmio_spi == NULL)
 		return false;
 
-	hif_spi_intr = ioremap(BCM_PHYSICAL_OFFSET + HIF_SPI_INTR2_BCM7435, HIF_SPI_INTR2_SIZE);
+	hif_spi_intr = ioremap(BCM_PHYSICAL_OFFSET + hif_spi_intr2, HIF_SPI_INTR2_SIZE);
 	if (hif_spi_intr == NULL)
 		return false;
 
 	/* disable kernel irq handler */
-	hif_spi_intr[0x10/4] = 0x7f;
+	hif_spi_intr[0x10/4] = HIF_SPI_INTR2_CPU_SET_MSPI_DONE_MASK;
 
 	mmio_spi[0x180] = 1;
 	mmio_spi[0x20] = 0;
 
 			/* set baudrate */
-	mmio_spi[0] = 0x6;          // SPCR, 8 = 1.6Mhz
+	mmio_spi[0] = spcr;          // SPCR, 8 = 1.6Mhz
 	mmio_spi[4] = (1<<7);     // SPCR0_MSB, spi master, 8 bits, clock polarity/phase
 
 	return true;
@@ -181,7 +295,7 @@ static void spi_exit(void)
 {
 	/* reenable kernel irq handler */
 	if (hif_spi_intr) {
-		hif_spi_intr[0x14/4] = 0x20;
+		hif_spi_intr[0x14/4] = HIF_SPI_INTR2_CPU_SET_MSPI_DONE_MASK;
 		iounmap(hif_spi_intr, HIF_SPI_INTR2_SIZE);
 	}
 
@@ -191,7 +305,7 @@ static void spi_exit(void)
 
 static int spirom_read_status(void)
 {
-	unsigned char cmd[] = { SPI_CMD_RDID, 0 };
+	unsigned char cmd[] = { SPI_CMD_RDSR, 0 };
 
 	spi_write_bytes(cmd, cmd, sizeof(cmd));
 
@@ -252,6 +366,10 @@ static bool spirom_reset(void)
 static bool spirom_read_id(void)
 {
 	unsigned char cmd[] = { SPI_CMD_RDID, 0, 0, 0 };
+	unsigned char mem_type;
+	unsigned char mem_density;
+	bool valid_type;
+	bool valid_density;
 
 	if (!spirom_wait_ready(1000))
 		return false;
@@ -262,17 +380,33 @@ static bool spirom_read_id(void)
 	printf("Memory type    : %02x\n", cmd[2]);
 	printf("Memory density : %02x\n", cmd[3]);
 
-	if (cmd[1] != 0xc2) {
+	mem_type = cmd[2];
+	mem_density = cmd[3];
+
+	switch (cmd[1]) {
+	case MANUF_ID_EON:
+		valid_type = (mem_type == 0x70);
+		valid_density = (mem_density == 0x18);
+		break;
+	case MANUF_ID_MACRONIX:
+		valid_type = (mem_type == 0x20);
+		valid_density = (mem_density == 0x18 || mem_density == 0x19);
+		break;
+	case MANUF_ID_WINBOND:
+		valid_type = (mem_type == 0x40);
+		valid_density = (mem_density == 0x18);
+		break;
+	default:
 		fprintf(stderr, "wrong manufacturer id\n");
 		return false;
 	}
 
-	if (cmd[2] != 0x20) {
+	if (!valid_type) {
 		fprintf(stderr, "wrong memory type\n");
 		return false;
 	}
 
-	if (cmd[3] != 0x18) {
+	if (!valid_density) {
 		fprintf(stderr, "wrong memory density\n");
 		return false;
 	}
@@ -401,37 +535,31 @@ static void bitmap_free(unsigned long *bitmap)
 	free(bitmap);
 }
 
-static bool write_file(const char *filename, size_t start)
+static bool write_file(int fd, size_t start, size_t size)
 {
+	unsigned char sector0[SPI_SECTOR_SIZE];
+	unsigned char sector1[SPI_SECTOR_SIZE];
 	unsigned char *mem = MAP_FAILED;
-	unsigned long *bitmap = NULL;
+	unsigned long *need_erase = NULL;
+	unsigned long *need_write = NULL;
 	size_t nsectors, nchanged = 0;
 	const unsigned char *src;
 	size_t i, pos, end;
-	struct stat st;
 	bool ret = false;
-	int fd;
 
-	fd = open(filename, O_RDONLY);
-	if (fd < 0) {
-		perror(filename);
-		goto err;
-	}
+	memset(sector0, 0x00, SPI_SECTOR_SIZE);
+	memset(sector1, 0xff, SPI_SECTOR_SIZE);
 
-	if (fstat(fd, &st) < 0) {
-		perror("fstat");
-		goto err;
-	}
-
-	mem = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+	mem = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
 	if (mem == MAP_FAILED) {
 		perror("mmap");
 		goto err;
 	}
 
-	end = start + st.st_size;
-	nsectors = (st.st_size + SPI_SECTOR_SIZE - 1) / SPI_SECTOR_SIZE;
-	bitmap = bitmap_alloc(nsectors);
+	end = start + size;
+	nsectors = (size + SPI_SECTOR_SIZE - 1) / SPI_SECTOR_SIZE;
+	need_erase = bitmap_alloc(nsectors);
+	need_write = bitmap_alloc(nsectors);
 
 	printf("comparing %zu sectors...\n", nsectors);
 
@@ -443,7 +571,10 @@ static bool write_file(const char *filename, size_t start)
 
 		spirom_read(pos, sector, len);
 		if (memcmp(sector, src, len)) {
-			bitmap_set(bitmap, i);
+			if (memcmp(src, sector0, len) && memcmp(sector, sector1, len))
+				bitmap_set(need_erase, i);
+			if (memcmp(src, sector1, len))
+				bitmap_set(need_write, i);
 			nchanged++;
 		}
 
@@ -466,7 +597,7 @@ static bool write_file(const char *filename, size_t start)
 
 	pos = start;
 	for (i = 0; i < nsectors; i++) {
-		if (bitmap_test(bitmap, i)) {
+		if (bitmap_test(need_erase, i)) {
 			if (!spirom_sector_erase(pos)) {
 				fprintf(stderr, "sector erase failed\n");
 				goto err;
@@ -481,7 +612,7 @@ static bool write_file(const char *filename, size_t start)
 	src = mem;
 	pos = start;
 	for (i = 0; i < nsectors; i++) {
-		if (bitmap_test(bitmap, i)) {
+		if (bitmap_test(need_write, i)) {
 			size_t len = MIN(end - pos, SPI_SECTOR_SIZE);
 			size_t offset;
 			for (offset = 0; offset < len; offset += SPI_PAGE_SIZE) {
@@ -499,7 +630,7 @@ static bool write_file(const char *filename, size_t start)
 	src = mem;
 	pos = start;
 	for (i = 0; i < nsectors; i++) {
-		if (bitmap_test(bitmap, i)) {
+		if (bitmap_test(need_erase, i) || bitmap_test(need_write, i)) {
 			unsigned char sector[SPI_SECTOR_SIZE];
 			size_t len = MIN(end - pos, SPI_SECTOR_SIZE);
 
@@ -520,26 +651,44 @@ static bool write_file(const char *filename, size_t start)
 	printf("flash done\n");
 	ret = true;
 err:
-	bitmap_free(bitmap);
+	bitmap_free(need_write);
+	bitmap_free(need_erase);
 	if (mem != MAP_FAILED)
-		munmap(mem, st.st_size);
-	if (fd != -1)
-		close(fd);
+		munmap(mem, size);
 	return ret;
 }
 
 int main(int argc, char **argv)
 {
+	const char *partname = "kernel";
+	const struct flash_part *part = NULL;
+	const struct flash_part *flash_map;
+	size_t flash_map_size;
+	unsigned int offset;
+	unsigned int chip_id;
+	unsigned int i;
+	struct stat st;
 	int ret = 1;
+	int fd;
 
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s <filename>\n", argv[0]);
+		fprintf(stderr, "usage: %s <filename> [<partition>]\n", argv[0]);
 		return 1;
 	}
 
-	signal(SIGHUP, SIG_IGN);
-	signal(SIGINT, SIG_IGN);
-	signal(SIGTERM, SIG_IGN);
+	fd = open(argv[1], O_RDONLY);
+	if (fd < 0) {
+		perror(argv[1]);
+		return 1;
+	}
+
+	if (fstat(fd, &st) < 0) {
+		perror("fstat");
+		goto err;
+	}
+
+	if (argc >= 3)
+		partname = argv[2];
 
 	devmem = open("/dev/mem", O_RDWR | O_SYNC);
 	if (devmem < 0) {
@@ -547,7 +696,55 @@ int main(int argc, char **argv)
 		goto err;
 	}
 
-	if (!spi_init()) {
+	if (!detect_soc(&chip_id))
+		goto err;
+
+	switch (chip_id) {
+	case 0x73625:
+		flash_map = flash_map_73625;
+		flash_map_size = ARRAY_SIZE(flash_map_73625);
+		break;
+	case 0x7435:
+		flash_map = flash_map_7435;
+		flash_map_size = ARRAY_SIZE(flash_map_7435);
+		break;
+	case 0x7439:
+		flash_map = flash_map_7439;
+		flash_map_size = ARRAY_SIZE(flash_map_7439);
+		break;
+	default:
+		goto err;
+	}
+
+	offset = 0;
+	for (i = 0; i < flash_map_size; i++) {
+		if (!strcmp(flash_map[i].name, partname)) {
+			part = &flash_map[i];
+			break;
+		}
+		offset += flash_map[i].size;
+	}
+
+	if (part == NULL) {
+		fprintf(stderr, "Invalid partition: %s\n", partname);
+		goto err;
+	}
+
+	if (part->rdonly) {
+		fprintf(stderr, "Sorry, writing to this partition is not allowed.\n");
+		goto err;
+	}
+
+	if (part->size < st.st_size) {
+		fprintf(stderr, "Input file is too big (max. %u bytes)\n", part->size);
+		goto err;
+	}
+
+	signal(SIGHUP, SIG_IGN);
+	signal(SIGINT, SIG_IGN);
+	signal(SIGTERM, SIG_IGN);
+
+	if (!spi_init(chip_id)) {
 		fprintf(stderr, "init failed\n");
 		goto err;
 	}
@@ -562,7 +759,7 @@ int main(int argc, char **argv)
 		goto err;
 	}
 
-	if (write_file(argv[1], 1024 * 1024))
+	if (write_file(fd, offset, st.st_size))
 		ret = 0;
 err:
 	spi_exit();
@@ -570,5 +767,6 @@ err:
 	if (devmem >= 0)
 		close(devmem);
 
+	close(fd);
 	return ret;
 }

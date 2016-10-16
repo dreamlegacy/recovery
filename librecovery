@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2014 Dream Property GmbH
+# Copyright (C) 2016 Dream Property GmbH
 #
 
 MMC_DEVICE=/dev/mmcblk0
@@ -9,7 +9,6 @@ ROOT_NAME=dreambox-rootfs
 DATA_PARTITION=/dev/mmcblk0p2
 DATA_MOUNTPOINT=/data
 DATA_NAME=dreambox-data
-RESCUE_PARTITION=/dev/mtdblock2
 RECOVERY_CACHE=${DATA_MOUNTPOINT}/.recovery
 FILESYSTEM=ext4
 
@@ -40,6 +39,11 @@ is_beneath_directory()
 is_blockdev()
 {
 	[ -b "${1}" ]
+}
+
+is_chardev()
+{
+	[ -c "${1}" ]
 }
 
 is_directory()
@@ -77,6 +81,11 @@ is_writable_blockdev()
 	is_blockdev "${1}" && is_writable "${1}"
 }
 
+is_writable_chardev()
+{
+	is_chardev "${1}" && is_writable "${1}"
+}
+
 is_writable_directory()
 {
 	is_directory "${1}" && is_writable "${1}"
@@ -90,11 +99,6 @@ is_empty()
 is_file_size_le()
 {
 	[ "`stat -c '%s' ${1}`" -le "${2}" ]
-}
-
-is_file_size_le_blockdev()
-{
-	is_file_size_le "${1}" "$((`sfdisk -s ${2}` * 1024))"
 }
 
 is_initrd()
@@ -155,16 +159,62 @@ create_directory()
 create_filesystem()
 {
 	info "Creating ${FILESYSTEM} filesystem '${1}' on ${2}"
-	xtrap mkfs.${FILESYSTEM} -L "${1}" "${2}" >&3 2>&4
+	xtrap mkfs.${FILESYSTEM} -L "${1}" "${2}"
+}
+
+blkdev_has_filesystem()
+{
+	blkid -o export "${1}" | grep -q "^TYPE=${FILESYSTEM}$"
+}
+
+create_nand_filesystem()
+{
+	info "Creating ${FILESYSTEM} filesystem on ${1}"
+	xtrap mkfs.${FILESYSTEM} "${1}"
+}
+
+erase()
+{
+	info "Erasing flash memory on ${1}"
+	xtrap flash_erase "${1}" 0 0
+}
+
+write_nand()
+{
+	info "Writing to NAND memory on ${1}"
+	xtrap nandwrite -p -m "${1}" "${2}"
+}
+
+format_ubi_device()
+{
+	info "Formatting ${1} for UBI"
+	xtrap ubiformat -y "${1}"
+}
+
+attach_ubi_device()
+{
+	info "Attaching ${1} to UBI"
+	xtrap ubiattach -d "${UBI_ID}" -p "${1}"
+}
+
+remove_ubi_volume()
+{
+	info "Removing volume ${UBI_VOL_ID} from ${UBI_DEVICE}"
+	xtrap ubirmvol "${UBI_DEVICE}" -n "${UBI_VOL_ID}"
+}
+
+create_ubi_volume()
+{
+	info "Creating volume ${UBI_VOL_ID} on ${UBI_DEVICE} (${ROOT_NAME})"
+	xtrap ubimkvol "${UBI_DEVICE}" -n "${UBI_VOL_ID}" -N "${ROOT_NAME}" -m
 }
 
 create_partition_table()
 {
 	info "Creating partition table"
-	xtrap parted --script --align=optimal "${1}" -- \
-		mklabel gpt \
-		mkpart primary ext2 72MiB 1GiB \
-		mkpart primary ext2 1GiB 100% >&3 2>&4
+	xtrap sgdisk -z \
+		-n 1:147456:2097151 -c 1:rootfs -t 1:8307 \
+		-n 2:2097152: -c 2:data -t 2:8300 "${1}"
 }
 
 create_tarball()
@@ -271,7 +321,7 @@ safe_mount()
 	else
 		create_directory "${dir}"
 		info "Mounting '${device}' to '${dir}'"
-		mount $@ "${device}" "${dir}" && MOUNTPOINTS="${MOUNTPOINTS}:${dir}"
+		mount $@ "${device}" "${dir}" && MOUNTPOINTS="${dir}:${MOUNTPOINTS}"
 	fi
 }
 
@@ -348,7 +398,9 @@ run_postinsts()
 		safe_mount /${fs} ${mountpoint}/${fs} -o bind || abort "Failed to mount ${mountpoint}/${fs}"
 	done
 	for package in $@; do
-		xchroot ${mountpoint} /var/lib/${pkgtype}/info/${package}.postinst || abort "Failed to run ${package}.postinst"
+		if [ -x "${mountpoint}/var/lib/${pkgtype}/info/${package}.postinst" ]; then
+			xchroot ${mountpoint} /var/lib/${pkgtype}/info/${package}.postinst || abort "Failed to run ${package}.postinst"
+		fi
 	done
 	for fs in ${virtfs}; do
 		unmount ${mountpoint}/${fs} || warn "Failed to unmount ${mountpoint}/${fs}"
