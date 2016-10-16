@@ -62,6 +62,11 @@ is_writable()
 	[ -w "${1}" ]
 }
 
+is_writable_blockdev()
+{
+	is_blockdev "${1}" && is_writable "${1}"
+}
+
 is_writable_chardev()
 {
 	is_chardev "${1}" && is_writable "${1}"
@@ -128,6 +133,17 @@ create_directory()
 }
 
 create_filesystem()
+{
+	info "Creating ${FILESYSTEM} filesystem '${1}' on ${2}"
+	xtrap mkfs.${FILESYSTEM} -L "${1}" "${2}"
+}
+
+blkdev_has_filesystem()
+{
+	blkid -o export "${1}" | grep -q "^TYPE=${FILESYSTEM}$"
+}
+
+create_nand_filesystem()
 {
 	info "Creating ${FILESYSTEM} filesystem on ${1}"
 	xtrap mkfs.${FILESYSTEM} "${1}"
@@ -292,7 +308,9 @@ run_postinsts()
 		safe_mount /${fs} ${mountpoint}/${fs} -o bind || abort "Failed to mount ${mountpoint}/${fs}"
 	done
 	for package in $@; do
-		xchroot ${mountpoint} /var/lib/${pkgtype}/info/${package}.postinst || abort "Failed to run ${package}.postinst"
+		if [ -x "${mountpoint}/var/lib/${pkgtype}/info/${package}.postinst" ]; then
+			xchroot ${mountpoint} /var/lib/${pkgtype}/info/${package}.postinst || abort "Failed to run ${package}.postinst"
+		fi
 	done
 	for fs in ${virtfs}; do
 		unmount ${mountpoint}/${fs} || warn "Failed to unmount ${mountpoint}/${fs}"
@@ -430,7 +448,7 @@ if is_chardev "${ROOT_PARTITION}"; then
 fi
 
 create_ubi_volume || abort "Failed to create UBI volume"
-create_filesystem "${ROOT_PARTITION}" || abort "Failed to create ${FILESYSTEM} filesystem on '${ROOT_PARTITION}'"
+create_nand_filesystem "${ROOT_PARTITION}" || abort "Failed to create ${FILESYSTEM} filesystem on '${ROOT_PARTITION}'"
 safe_mount "${ROOT_PARTITION}" "${ROOT_MOUNTPOINT}" || abort "Failed to mount root filesystem"
 extract_tarball "${FILENAME}" "${ROOT_MOUNTPOINT}" || abort "Failed to extract root filesystem"
 run_postinsts "${ROOT_MOUNTPOINT}" dreambox-secondstage kernel-image || abort "Failed to run postinst scripts"
