@@ -7,15 +7,17 @@ sbindir ?= $(exec_prefix)/sbin
 override CFLAGS := $(CFLAGS) -Wall -std=c99
 override CPPFLAGS := $(CPPFLAGS) -DNDEBUG
 
-SCRIPTS := backup-tarball flash-kernel flash-rescue flash-ssbl flash-tarball help librecovery recovery run-recovery select-boot-source to-the-rescue
-TARGETS := writespi
+SCRIPTS := backup-settings backup-tarball flash-kernel flash-rescue flash-ssbl flash-tarball help librecovery recovery run-recovery restore-settings select-boot-source
+TARGETS := to-the-rescue writespi
 
 default: $(TARGETS)
 
-writespi: writespi.c
+to-the-rescue: io.o
+
+writespi: io.o
 
 clean:
-	$(RM) $(TARGETS)
+	$(RM) $(wildcard $(TARGETS) *.o)
 
 install: $(TARGETS)
 	install -d $(DESTDIR)$(sbindir)

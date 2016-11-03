@@ -132,12 +132,19 @@ create_directory()
 create_filesystem()
 {
 	info "Creating ${FILESYSTEM} filesystem '${1}' on ${2}"
-	xtrap mkfs.${FILESYSTEM} -L "${1}" "${2}"
+	xtrap mkfs.${FILESYSTEM} -F -L "${1}" "${2}"
 }
 
 blkdev_has_filesystem()
 {
-	blkid -o export "${1}" | grep -q "^TYPE=${FILESYSTEM}$"
+	is_blockdev "${1}" && (
+		if hash blkid 2>/dev/null; then
+			blkid -o export "${1}" | grep -q "^TYPE=${FILESYSTEM}$"
+		else
+			local dir=`mktemp -d -p ${WORKSPACE}` || abort 'Failed to create temporary mount point'
+			grep -q "^${1}\s[^\s]\+\s${FILESYSTEM}\s" /proc/mounts || (mount -t ${FILESYSTEM} -o ro "${1}" "${dir}" 2>/dev/null && umount "${dir}")
+		fi
+	)
 }
 
 create_nand_filesystem()
@@ -179,13 +186,16 @@ create_ubi_volume()
 create_partition_table()
 {
 	info "Creating partition table"
-	xtrap sgdisk -z \
-		-n 1:147456:2097151 -c 1:rootfs -t 1:8307 \
-		-n 2:2097152: -c 2:data -t 2:8300 "${1}" || \
-	xtrap parted --script --align=optimal "${1}" -- \
-		mklabel gpt \
-		mkpart primary ext2 72MiB 1GiB \
-		mkpart primary ext2 1GiB 100% >&3 2>&4
+	if hash sgdisk 2>/dev/null; then
+		xtrap sgdisk -z \
+			-n 1:147456:2097151 -c 1:rootfs -t 1:8307 \
+			-n 2:2097152: -c 2:data -t 2:8300 "${1}"
+	else
+		xtrap parted --script --align=optimal "${1}" -- \
+			mklabel gpt \
+			mkpart primary ext2 72MiB 1GiB \
+			mkpart primary ext2 1GiB 100% >&3 2>&4
+	fi
 }
 
 create_workspace()
@@ -283,10 +293,21 @@ remount_cache_rw()
 
 update_cache()
 {
+	if [ -f "${1}" ] && remount_cache_rw; then
+		create_directory "${RECOVERY_CACHE}"
+		if is_directory "${RECOVERY_CACHE}"; then
+			info "Updating recovery cache (${1})"
+			xcp "${1}" "${RECOVERY_CACHE}/${1}" || true
+		fi
+	fi
+}
+
+update_cache_signed()
+{
 	if cache_changed "${1}" && remount_cache_rw; then
 		create_directory "${RECOVERY_CACHE}"
 		if is_directory "${RECOVERY_CACHE}"; then
-			info "Updating recovery cache"
+			info "Updating recovery cache (${1})"
 			xcp "${1}" "${RECOVERY_CACHE}/${1}" || true
 			xcp "${1}.sig" "${RECOVERY_CACHE}/${1}.sig" || true
 		fi
@@ -333,7 +354,7 @@ assert_rescue_mode()
 
 usage()
 {
-	echo "Usage: ${0} [-hqtv]"
+	echo "Usage: ${0} [-bhqrtv]"
 	exit ${1}
 }
 
@@ -378,15 +399,6 @@ xdd()
 	xtrap dd conv=fsync $@
 }
 
-xgetopts()
-{
-	local opt
-
-	while getopts hqtv opt; do
-		std_opt "${opt}"
-	done
-}
-
 xrealpath()
 {
 	local opt
@@ -418,7 +430,21 @@ xtrap()
 	(trap '' HUP INT TERM; exec $@) >&3 2>&4
 }
 
-xgetopts $@
+BACKUP_SETTINGS=":"
+RESTORE_SETTINGS=":"
+SETTINGS="settings.tar.gz"
+
+while getopts bhqrtv opt; do
+	case "${opt}" in
+		b)
+			BACKUP_SETTINGS="backup-settings ${SETTINGS}"
+			;;
+		r)
+			RESTORE_SETTINGS="restore-settings ${SETTINGS}"
+			;;
+	esac
+	std_opt "${opt}"
+done
 
 assert_rescue_mode
 
@@ -445,12 +471,19 @@ EOF
 mount_cache
 fetch_signed "${BASE_URI}" "${FILENAME}"
 
-if ! is_blockdev "${ROOT_PARTITION}" || ! is_blockdev "${DATA_PARTITION}" \
-   ! blkdev_has_filesystem "${ROOT_PARTITION}" || ! blkdev_has_filesystem "${DATA_PARTITION}"; then
+if blkdev_has_filesystem "${ROOT_PARTITION}"; then
+	${BACKUP_SETTINGS}
+fi
+
+if ! is_blockdev "${ROOT_PARTITION}" || ! blkdev_has_filesystem "${DATA_PARTITION}"; then
 	unmount "${ROOT_MOUNTPOINT}" || abort "Failed to unmount root filesystem"
 	unmount "${DATA_MOUNTPOINT}" || abort "Failed to unmount data filesystem"
-	create_partition_table "${MMC_DEVICE}" || abort "Failed to partition disk"
-	create_filesystem "${DATA_NAME}" "${DATA_PARTITION}" || warn "Failed to create ${FILESYSTEM} filesystem '${DATA_NAME}' on '${DATA_PARTITION}'"
+	if ! is_blockdev "${ROOT_PARTITION}" || ! is_blockdev "${DATA_PARTITION}"; then
+		create_partition_table "${MMC_DEVICE}" || abort "Failed to partition disk"
+	fi
+	if ! blkdev_has_filesystem "${DATA_PARTITION}"; then
+		create_filesystem "${DATA_NAME}" "${DATA_PARTITION}" || warn "Failed to create ${FILESYSTEM} filesystem '${DATA_NAME}' on '${DATA_PARTITION}'"
+	fi
 	mount_cache
 fi
 
@@ -459,9 +492,11 @@ create_filesystem "${ROOT_NAME}" "${ROOT_PARTITION}" || abort "Failed to create 
 safe_mount "${ROOT_PARTITION}" "${ROOT_MOUNTPOINT}" || abort "Failed to mount root filesystem"
 extract_tarball "${FILENAME}" "${ROOT_MOUNTPOINT}" || abort "Failed to extract root filesystem"
 run_postinsts "${ROOT_MOUNTPOINT}" dreambox-secondstage kernel-image || abort "Failed to run postinst scripts"
+${RESTORE_SETTINGS}
 unmount "${ROOT_MOUNTPOINT}" || warn "Failed to unmount root filesystem"
 
-update_cache "${FILENAME}"
+update_cache "${SETTINGS}"
+update_cache_signed "${FILENAME}"
 unmount_cache
 
 info "Initiating reboot"

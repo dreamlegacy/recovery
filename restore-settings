@@ -1,0 +1,50 @@
+#!/bin/sh
+#
+# Copyright (C) 2016 Dream Property GmbH
+#
+
+source librecovery
+
+FILENAME=${RECOVERY_CACHE}/settings.tar.gz
+
+usage()
+{
+	echo "Usage: ${0} [-hqtv] [<settings.tar.gz>]"
+	echo "       Default: ${FILENAME}"
+	exit ${1}
+}
+
+xgetopts $@
+
+shift $((${OPTIND} - 1))
+[ "$#" -le 1 ] || usage 1
+[ "$#" -eq 0 ] || FILENAME=`xrealpath ${1}`
+
+assert_rescue_mode
+create_workspace
+
+if is_beneath_directory "${FILENAME}" "${DATA_MOUNTPOINT}"; then
+	safe_mount "${DATA_PARTITION}" "${DATA_MOUNTPOINT}" -o ro || abort "Failed to mount data filesystem"
+fi
+safe_mount "${ROOT_PARTITION}" "${ROOT_MOUNTPOINT}" || abort "Failed to mount root filesystem"
+
+mkdir settings
+extract_tarball "${FILENAME}" settings || abort "Failed to extract settings"
+
+if [ -d "settings/tmp/.recovery/" ]; then
+	if [ -f "settings/tmp/.recovery/backup-paths.bak" ]; then
+		IFS=$'\n'
+		set -- $(cat settings/tmp/.recovery/backup-paths.bak)
+		unset IFS
+		for path; do
+			rm -rf "${ROOT_MOUNTPOINT}${path}"
+		done
+	fi
+	if [ -f "settings/tmp/.recovery/pwhash-root.bak" ]; then
+		info "Restoring root password"
+		PWHASH=$(cat "settings/tmp/.recovery/pwhash-root.bak")
+		sed -e "s,^\(root:\)[^:]*\(:.*\),\1${PWHASH}\2," -i "${ROOT_MOUNTPOINT}/etc/shadow"
+	fi
+	rm -rf settings/tmp
+fi
+cp -a settings/* ${ROOT_MOUNTPOINT}/
