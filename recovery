@@ -137,7 +137,14 @@ create_filesystem()
 
 blkdev_has_filesystem()
 {
-	is_blockdev "${1}" && blkid -o export "${1}" | grep -q "^TYPE=${FILESYSTEM}$"
+	is_blockdev "${1}" && (
+		if hash blkid 2>/dev/null; then
+			blkid -o export "${1}" | grep -q "^TYPE=${FILESYSTEM}$"
+		else
+			local dir=`mktemp -d -p ${WORKSPACE}` || abort 'Failed to create temporary mount point'
+			grep -q "^${1}\s[^\s]\+\s${FILESYSTEM}\s" /proc/mounts || (mount -t ${FILESYSTEM} -o ro "${1}" "${dir}" 2>/dev/null && umount "${dir}")
+		fi
+	)
 }
 
 create_nand_filesystem()
@@ -179,13 +186,16 @@ create_ubi_volume()
 create_partition_table()
 {
 	info "Creating partition table"
-	xtrap sgdisk -z \
-		-n 1:147456:2097151 -c 1:rootfs -t 1:8307 \
-		-n 2:2097152: -c 2:data -t 2:8300 "${1}" || \
-	xtrap parted --script --align=optimal "${1}" -- \
-		mklabel gpt \
-		mkpart primary ext2 72MiB 1GiB \
-		mkpart primary ext2 1GiB 100% >&3 2>&4
+	if hash sgdisk 2>/dev/null; then
+		xtrap sgdisk -z \
+			-n 1:147456:2097151 -c 1:rootfs -t 1:8307 \
+			-n 2:2097152: -c 2:data -t 2:8300 "${1}"
+	else
+		xtrap parted --script --align=optimal "${1}" -- \
+			mklabel gpt \
+			mkpart primary ext2 72MiB 1GiB \
+			mkpart primary ext2 1GiB 100% >&3 2>&4
+	fi
 }
 
 create_workspace()
